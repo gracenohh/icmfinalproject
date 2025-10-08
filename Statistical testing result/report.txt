@@ -1,0 +1,4 @@
+Basal Ganglia ROI analysis (ADHD vs Control/Normal) — MW only
+Diagnosis column: Diagnosis
+Results CSV: /Users/harry/Desktop/ICM/Final Proect/basal_ganglia_ADHD_vs_Control_MW_results.csv
+FDR alpha: 0.05
