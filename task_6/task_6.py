@@ -1,39 +1,28 @@
 """
-Task 6 — MNI-vs-Population Comparison (2-file version)
+Task 6 — MNI vs Population (PCA colored by demographics)
 
-WHAT THIS DOES
---------------
-Reads:
-  1) A CSV of ROI z-scores for ALL subjects (population)
-  2) A CSV of ROI z-scores for the SINGLE MNI subject
-
-Then it:
-  - Aligns ROI features between the two files (intersection of ROI names)
-  - Computes distances (Euclidean + Cosine) from the MNI subject to each population subject
-  - Saves a ranked bar plot of distances and a 2D PCA scatter highlighting MNI
-  - Writes a distances table (CSV) and the list of ROIs used
-
-HOW TO USE
+WHAT'S NEW
 ----------
-1) Edit the two file paths below (population_csv, mni_csv). They are pre-filled with your provided files.
-2) Edit optional settings (subject_col, standardize, metric, outdir) if needed.
-3) Run:  python task6_mni_vs_population.py
+In addition to the ranked distance plot and the base PCA scatter,
+this version generates THREE extra PCA maps that color the POPULATION
+by each demographic field (if present) while still highlighting the MNI:
+  - Diagnose  (categorical)
+  - age       (numeric, continuous)
+  - gender    (categorical)
 
-ASSUMPTIONS / FLEXIBLE FORMATS
-------------------------------
-- WIDE format (preferred): one row per subject, ROI columns are numeric z-scores.
-  * A subject ID column is recommended (e.g., "subject", "id", "SubjectID"). If not present, row index is used.
-- LONG format (also supported): columns like ["subject","ROI","z"] or ["subject","roi","value"] etc.
-  * The loader will try to pivot to wide format automatically.
-
-PLOTS (PNG)
------------
-- distances_ranked.png : ranked bar plot of chosen metric
-- pca_scatter.png      : PCA(2D) of population+MNI with MNI highlighted
+FILES (edit paths below)
+------------------------
+- population_csv: ROI z-scores for ALL subjects (wide or long format supported)
+- mni_csv       : ROI z-scores for SINGLE MNI subject (wide one-row or long format)
 
 OUTPUTS
 -------
 - distances.csv
+- distances_ranked.png
+- pca_scatter.png                 (population gray + MNI star)
+- pca_scatter_by_Diagnose.png     (if 'Diagnose' found)
+- pca_scatter_by_age.png          (if 'age' found)
+- pca_scatter_by_gender.png       (if 'gender' found)
 - features_used.txt
 - README.txt
 """
@@ -50,16 +39,15 @@ from sklearn.metrics.pairwise import euclidean_distances, cosine_distances
 # ============================
 # 🔧 USER SETTINGS (edit here)
 # ============================
-# Your real files (pre-filled from your message)
 population_csv = "/Users/harry/Desktop/ICM/Final Proect/git/ROI_z_scores.csv"  # ROI z-scores for ALL subjects
 mni_csv        = "/Users/harry/Desktop/ICM/Final Proect/git/MNI Subject/z_scores.csv"  # ROI z-scores for MNI subject (single subject)
 
-# If your population file has a subject ID column, put its name here; else set to None to auto-detect or use row index
+# If your population file has a subject ID column name, put it here (else None to auto-guess or use row index)
 subject_col: Optional[str] = None
 
 # Distances + viz settings
-standardize: bool = False   # Usually False for z-scores; set True if your features are raw and need scaling
-metric: str = "euclidean"   # "euclidean" or "cosine" (for the ranked bar plot)
+standardize: bool = False   # For z-scores, usually False; set True if features need scaling
+metric: str = "euclidean"   # "euclidean" or "cosine" for ranked bar plot
 outdir: str = "/Users/harry/Desktop/ICM/Final Proect/git/task_6"
 # ============================
 
@@ -69,102 +57,57 @@ def _ensure_outdir(path: str) -> str:
     os.makedirs(path, exist_ok=True)
     return os.path.abspath(path)
 
-
 def _guess_subject_col(df: pd.DataFrame) -> Optional[str]:
-    """Heuristic: pick the first non-numeric column as subject ID if any; else None."""
     non_numeric = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
     return non_numeric[0] if non_numeric else None
 
-
 def _is_likely_long_format(df: pd.DataFrame) -> bool:
-    """A rough check: long format typically has columns like subject/roi/value and fewer columns total."""
     cols = {c.lower() for c in df.columns}
     has_roi = any(k in cols for k in ["roi", "region", "roiname"])
     has_val = any(k in cols for k in ["z", "zscore", "value", "score"])
     has_sub = any(k in cols for k in ["subject", "id", "subject_id", "subjid"])
     return has_roi and has_val and has_sub and (df.shape[1] <= 5)
 
-
 def _pivot_long_to_wide(df: pd.DataFrame) -> Tuple[pd.DataFrame, str, List[str]]:
-    """
-    Convert long format (subject, ROI, value) to wide matrix: rows=subjects, cols=ROI.
-    Tries flexible column name detection.
-    """
-    # Detect columns by lowercase name
     lower_map = {c.lower(): c for c in df.columns}
-    # Subject
-    subj_candidates = [k for k in ["subject", "subject_id", "id", "subjid"] if k in lower_map]
-    if not subj_candidates:
+    subj_col = next((lower_map[k] for k in ["subject","subject_id","id","subjid"] if k in lower_map), None)
+    if subj_col is None:
         raise ValueError("Long format detected but could not find a subject ID column.")
-    subj_col = lower_map[subj_candidates[0]]
-    # ROI name
-    roi_candidates = [k for k in ["roi", "region", "roiname"] if k in lower_map]
-    if not roi_candidates:
+    roi_col  = next((lower_map[k] for k in ["roi","region","roiname"] if k in lower_map), None)
+    if roi_col is None:
         raise ValueError("Long format detected but could not find an ROI column.")
-    roi_col = lower_map[roi_candidates[0]]
-    # Value column (z-score)
-    val_candidates = [k for k in ["z", "zscore", "value", "score"] if k in lower_map]
-    if not val_candidates:
-        # last resort – choose the first numeric column that is not ROI/subject
+    val_col  = next((lower_map[k] for k in ["z","zscore","value","score"] if k in lower_map), None)
+    if val_col is None:
         numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
         if not numeric_cols:
             raise ValueError("Long format detected but could not find a numeric value column.")
         val_col = numeric_cols[0]
-    else:
-        val_col = lower_map[val_candidates[0]]
-
     wide = df.pivot_table(index=subj_col, columns=roi_col, values=val_col, aggfunc="mean")
-    wide = wide.sort_index()
-    wide = wide.reset_index()
-    # subject column remains as its original name
+    wide = wide.sort_index().reset_index()
     feature_cols = [c for c in wide.columns if c != subj_col]
     return wide, subj_col, feature_cols
 
-
 def _load_population_matrix(pop_csv: str, user_subject_col: Optional[str]) -> Tuple[pd.DataFrame, str, List[str]]:
-    """
-    Load population CSV and return (wide_df, subject_col, feature_cols).
-    Supports both wide and long formats.
-    """
     df = pd.read_csv(pop_csv)
-    # LONG?
     if _is_likely_long_format(df):
-        wide, subj_col, features = _pivot_long_to_wide(df)
-        return wide, subj_col, features
+        return _pivot_long_to_wide(df)
 
-    # WIDE: determine subject column
     subj_col = user_subject_col or _guess_subject_col(df)
     if subj_col is None:
-        # No subject column — fabricate an index-based subject ID
         df = df.copy()
         df.insert(0, "subject", [f"S{i}" for i in range(len(df))])
         subj_col = "subject"
 
-    # Feature columns: numeric and not the subject col
     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     feature_cols = [c for c in numeric_cols if c != subj_col]
     if not feature_cols:
-        # If nothing numeric, try all columns except subject and convert to numeric where possible
         candidates = [c for c in df.columns if c != subj_col]
-        try:
-            df[candidates] = df[candidates].apply(pd.to_numeric, errors="raise")
-            feature_cols = candidates
-        except Exception as e:
-            raise ValueError("Could not identify numeric ROI columns in population CSV.") from e
-
+        df[candidates] = df[candidates].apply(pd.to_numeric, errors="raise")
+        feature_cols = candidates
     return df, subj_col, feature_cols
 
-
 def _load_mni_vector(mni_csv: str) -> pd.Series:
-    """
-    Load the MNI file and return a single-row vector of ROI z-scores as a pandas Series.
-    Supports:
-      - wide single-row CSV (numeric ROI columns)
-      - long CSV with columns like [ROI, z]
-    """
     df = pd.read_csv(mni_csv)
-
-    # LONG vector?
     if _is_likely_long_format(df):
         wide, subj_col, feature_cols = _pivot_long_to_wide(df)
         if wide.shape[0] != 1:
@@ -172,28 +115,20 @@ def _load_mni_vector(mni_csv: str) -> pd.Series:
         row = wide.iloc[0]
         return row.drop(labels=[subj_col])
 
-    # WIDE: expect exactly one row after ignoring any subject column
-    subj_col_guess = _guess_subject_col(df)
+    subj_guess = _guess_subject_col(df)
     if df.shape[0] != 1:
-        # If multiple rows, try to require 1 distinct subject
-        if subj_col_guess and df[subj_col_guess].nunique() == 1:
+        if subj_guess and df[subj_guess].nunique() == 1:
             df = df.iloc[[0]].copy()
         else:
             raise ValueError("MNI CSV (wide) must contain exactly one row (one subject).")
-
     row = df.iloc[0]
-    # Drop subject column if present
-    if subj_col_guess is not None and subj_col_guess in row.index:
-        row = row.drop(labels=[subj_col_guess])
-
-    # Keep only numeric values (ROI z-scores)
-    numeric = pd.to_numeric(row, errors="coerce")
-    numeric = numeric.dropna()
+    if subj_guess is not None and subj_guess in row.index:
+        row = row.drop(labels=[subj_guess])
+    numeric = pd.to_numeric(row, errors="coerce").dropna()
     if numeric.empty:
         raise ValueError("MNI CSV does not contain numeric ROI z-scores.")
     numeric.index.name = None
     return numeric
-
 
 # --------- Distance + Visualization ----------
 def compute_distances(
@@ -202,41 +137,30 @@ def compute_distances(
     feature_cols: List[str],
     mni_series: pd.Series,
     standardize_features: bool
-) -> pd.DataFrame:
-    """
-    Align ROIs between population and MNI, compute distances for each subject.
-    Returns DataFrame with [subject, euclidean, cosine].
-    """
-    # Align ROI columns (intersection)
+) -> Tuple[pd.DataFrame, List[str]]:
     pop_rois = set(feature_cols)
-    mni_rois = set(mni_series.index.astype(str))
+    mni_rois = set(map(str, mni_series.index))
     common = sorted(list(pop_rois & mni_rois))
     if len(common) == 0:
         raise ValueError("No overlapping ROI names between population and MNI files.")
-
     X = pop_df[common].to_numpy(dtype=float)
     mni_vec = mni_series[common].to_numpy(dtype=float).reshape(1, -1)
-
     if standardize_features:
         scaler = StandardScaler(with_mean=True, with_std=True)
         X = scaler.fit_transform(X)
         mni_vec = scaler.transform(mni_vec)
-
     eu = euclidean_distances(X, mni_vec).reshape(-1)
     co = cosine_distances(X, mni_vec).reshape(-1)
-
     return pd.DataFrame({
         subject_col: pop_df[subject_col].astype(str).values,
         "euclidean": eu,
         "cosine": co
     }), common
 
-
 def plot_ranked(dist_df: pd.DataFrame, subject_col: str, metric: str, out_png: str) -> None:
     data = dist_df.sort_values(metric, ascending=True).reset_index(drop=True)
     labels = data[subject_col].tolist()
     values = data[metric].to_numpy(dtype=float)
-
     plt.figure(figsize=(12, 6))
     plt.bar(range(len(values)), values)
     plt.xticks(range(len(labels)), labels, rotation=90)
@@ -247,56 +171,155 @@ def plot_ranked(dist_df: pd.DataFrame, subject_col: str, metric: str, out_png: s
     plt.savefig(out_png, dpi=200)
     plt.close()
 
-
-def plot_pca_with_mni(
-    pop_df: pd.DataFrame,
-    subject_col: str,
-    roi_cols: List[str],
-    mni_series: pd.Series,
-    out_png: str,
-    standardize_features: bool
-) -> None:
-    """
-    PCA on population + MNI (appended), highlight MNI with a star.
-    """
-    # Build combined matrix
+def _compute_pca_coordinates(pop_df: pd.DataFrame, roi_cols: List[str], mni_series: pd.Series, standardize_features: bool):
     X_pop = pop_df[roi_cols].to_numpy(dtype=float)
     x_mni = mni_series[roi_cols].to_numpy(dtype=float).reshape(1, -1)
     X_all = np.vstack([X_pop, x_mni])
-
     if standardize_features:
         scaler = StandardScaler(with_mean=True, with_std=True)
         X_all = scaler.fit_transform(X_all)
-
     pca = PCA(n_components=2, random_state=0)
     X2 = pca.fit_transform(X_all)
-
     n_pop = X_pop.shape[0]
-    mni_pt = X2[n_pop, :]
+    return X2[:n_pop, :], X2[n_pop, :]
 
+def plot_pca_base(pop_df: pd.DataFrame, roi_cols: List[str], mni_series: pd.Series, out_png: str, standardize_features: bool):
+    X2_pop, mni_pt = _compute_pca_coordinates(pop_df, roi_cols, mni_series, standardize_features)
     plt.figure(figsize=(8, 6))
-    plt.scatter(X2[:n_pop, 0], X2[:n_pop, 1], alpha=0.7, label="Population")
+    plt.scatter(X2_pop[:, 0], X2_pop[:, 1], alpha=0.7, label="Population")
     plt.scatter(mni_pt[0], mni_pt[1], s=140, marker="*", label="MNI")
-    plt.xlabel("PC1")
-    plt.ylabel("PC2")
-    plt.title("PCA: MNI vs Population (aligned ROIs)")
+    plt.xlabel("PC1"); plt.ylabel("PC2"); plt.title("PCA: MNI vs Population (aligned ROIs)")
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_png, dpi=200)
     plt.close()
 
+def plot_pca_by_category(
+    pop_df: pd.DataFrame,
+    roi_cols: List[str],
+    mni_series: pd.Series,
+    category_col: str,
+    out_png: str,
+    standardize_features: bool
+) -> None:
+    """
+    PCA colored by a categorical column (e.g., gender, diagnosis).
+    - Each category is plotted as a separate layer for a clean legend.
+    - Missing values are treated as a distinct "Missing" category.
+    - MNI point is highlighted with a star.
+    """
+    if category_col not in pop_df.columns:
+        return
+
+    # Prepare categories (treat missing as a category)
+    cats = pop_df[category_col].astype("object").fillna("Missing")
+    cats = pd.Series(cats, dtype="category")
+    if cats.cat.categories.size == 0:
+        return
+
+    # Compute PCA coordinates (population + MNI)
+    X2_pop, mni_pt = _compute_pca_coordinates(
+        pop_df=pop_df, roi_cols=roi_cols, mni_series=mni_series, standardize_features=standardize_features
+    )
+
+    # Plot each category as a separate scatter for a readable legend
+    plt.figure(figsize=(8, 6))
+    handles = []
+    labels = []
+    for cat in cats.cat.categories:
+        idx = np.where(cats.values == cat)[0]
+        if idx.size == 0:
+            continue
+        h = plt.scatter(X2_pop[idx, 0], X2_pop[idx, 1], alpha=0.85)
+        handles.append(h)
+        labels.append(str(cat))
+
+    # Highlight MNI
+    plt.scatter(mni_pt[0], mni_pt[1], s=160, marker="*", label="MNI")
+
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.title(f"PCA colored by {category_col}")
+    if handles:
+        plt.legend(handles + [plt.Line2D([], [], linestyle="none", marker="*", markersize=10)],
+                   labels + ["MNI"], title=category_col, loc="best")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+
+
+def plot_pca_by_numeric(
+    pop_df: pd.DataFrame,
+    roi_cols: List[str],
+    mni_series: pd.Series,
+    numeric_col: str,
+    out_png: str,
+    standardize_features: bool
+) -> None:
+    """
+    PCA colored by a numeric column (e.g., age) with a smooth gradient.
+    - Values are coerced to numeric for coloring.
+    - Colorbar shows integer ticks spanning the observed range.
+    - Points with NaN in the numeric column are still plotted (without contributing to the color scale).
+    - MNI point is highlighted with a star.
+    """
+    if numeric_col not in pop_df.columns:
+        return
+
+    vals = pd.to_numeric(pop_df[numeric_col], errors="coerce")
+    if vals.notna().sum() == 0:
+        # Nothing numeric to color by
+        return
+
+    # Integer-tick display (do not modify actual values)
+    int_vals = vals.round().astype("Int64")
+
+    # Compute PCA coordinates (population + MNI)
+    X2_pop, mni_pt = _compute_pca_coordinates(
+        pop_df=pop_df, roi_cols=roi_cols, mni_series=mni_series, standardize_features=standardize_features
+    )
+
+    # Scatter with continuous colormap; NaN values get default facecolor
+    plt.figure(figsize=(8, 6))
+    sc = plt.scatter(X2_pop[:, 0], X2_pop[:, 1], c=vals, alpha=0.9, cmap='viridis')
+
+    # Colorbar with integer ticks
+    cbar = plt.colorbar(sc)
+    cbar.set_label(numeric_col)
+
+    if int_vals.notna().any():
+        vmin = int(int_vals.min())
+        vmax = int(int_vals.max())
+        if vmin == vmax:
+            ticks = [vmin]
+        else:
+            # Choose up to ~6 nicely spaced integer ticks
+            span = vmax - vmin
+            step = max(1, span // 5)
+            ticks = list(range(vmin, vmax + 1, step))
+        cbar.set_ticks(ticks)
+        cbar.set_ticklabels([str(t) for t in ticks])
+
+    # Highlight MNI
+    plt.scatter(mni_pt[0], mni_pt[1], s=160, marker="*", c='red', edgecolors='black', linewidths=1.5, label="MNI", zorder=5)
+
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.title(f"PCA colored by {numeric_col} (continuous)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    plt.close()
 
 # --------- Main ----------
 def main():
     out_path = _ensure_outdir(outdir)
 
-    # Load population
+    # Load population + MNI
     pop_df, subj_col_resolved, feature_cols = _load_population_matrix(population_csv, subject_col)
-
-    # Load MNI vector
     mni_vec = _load_mni_vector(mni_csv)
 
-    # Compute distances (and aligned ROI list actually used)
+    # Distances + ROI alignment actually used
     dist_df, used_rois = compute_distances(
         pop_df=pop_df,
         subject_col=subj_col_resolved,
@@ -305,14 +328,14 @@ def main():
         standardize_features=standardize
     )
 
-    # Save outputs
+    # Save table + feature list
     dist_csv = os.path.join(out_path, "distances.csv")
     dist_df.to_csv(dist_csv, index=False)
-
     with open(os.path.join(out_path, "features_used.txt"), "w", encoding="utf-8") as f:
         for r in used_rois:
             f.write(f"{r}\n")
 
+    # README
     with open(os.path.join(out_path, "README.txt"), "w", encoding="utf-8") as f:
         f.write("Task 6: MNI vs Population Comparison\n")
         f.write(f"- Population file: {population_csv}\n")
@@ -322,29 +345,47 @@ def main():
         f.write(f"- Metric (plot) : {metric}\n")
         f.write(f"- #ROIs used    : {len(used_rois)}\n")
 
-    # Visualizations
-    ranked_png = os.path.join(out_path, "distances_ranked.png")
-    chosen_metric = metric if metric in ("euclidean", "cosine") else "euclidean"
-    plot_ranked(dist_df, subject_col=subj_col_resolved, metric=chosen_metric, out_png=ranked_png)
+    # Visualizations (ranked + base PCA)
+    plot_ranked(dist_df, subject_col=subj_col_resolved,
+                metric=(metric if metric in ("euclidean", "cosine") else "euclidean"),
+                out_png=os.path.join(out_path, "distances_ranked.png"))
+    plot_pca_base(pop_df, used_rois, mni_vec,
+                  out_png=os.path.join(out_path, "pca_scatter.png"),
+                  standardize_features=standardize)
 
-    pca_png = os.path.join(out_path, "pca_scatter.png")
-    plot_pca_with_mni(
-        pop_df=pop_df,
-        subject_col=subj_col_resolved,
-        roi_cols=used_rois,
-        mni_series=mni_vec,
-        out_png=pca_png,
-        standardize_features=standardize
-    )
+    # Demographic-aware PCA maps (case-insensitive matching to 'Diagnose', 'age', 'gender')
+    # Build a case-insensitive mapping
+    lower_map = {c.lower(): c for c in pop_df.columns}
+    
+    # Diagnosis (categorical)
+    for key in ["diagnose", "diagnosis", "dx"]:
+        if key in lower_map:
+            plot_pca_by_category(pop_df, used_rois, mni_vec,
+                                 category_col=lower_map[key],
+                                 out_png=os.path.join(out_path, "pca_scatter_by_Diagnose.png"),
+                                 standardize_features=standardize)
+            break
+    
+    # Gender (categorical) - FIXED: use lowercase keys
+    for key in ["gender", "sex"]:
+        if key in lower_map:
+            plot_pca_by_category(pop_df, used_rois, mni_vec,
+                                 category_col=lower_map[key],
+                                 out_png=os.path.join(out_path, "pca_scatter_by_gender.png"),
+                                 standardize_features=standardize)
+            break
+    
+    # Age (numeric) - FIXED: use lowercase keys
+    for key in ["age", "age_years"]:
+        if key in lower_map:
+            plot_pca_by_numeric(pop_df, used_rois, mni_vec,
+                                numeric_col=lower_map[key],
+                                out_png=os.path.join(out_path, "pca_scatter_by_age.png"),
+                                standardize_features=standardize)
+            break
 
-    print("✅ Completed Task 6.")
+    print("✅ Completed Task 6 with demographic-colored PCA maps.")
     print(f"Outputs written to: {out_path}")
-    print(f"- {os.path.basename(dist_csv)}")
-    print(f"- distances_ranked.png")
-    print(f"- pca_scatter.png")
-    print(f"- features_used.txt")
-    print("- README.txt")
-
 
 if __name__ == "__main__":
     main()
