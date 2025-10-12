@@ -1,0 +1,10 @@
+Caud_L
+Caud_R
+Caudate_tail_L
+Caudate_tail_R
+GP_L
+GP_R
+NucAccumbens_L
+NucAccumbens_R
+Put_L
+Put_R

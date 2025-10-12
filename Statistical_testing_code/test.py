@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from scipy.stats import mannwhitneyu
+from scipy.stats import mannwhitneyu, rankdata
 import matplotlib.pyplot as plt
 
 # --------------------------
@@ -35,6 +35,32 @@ def benjamini_hochberg(pvals: np.ndarray):
     q = np.empty(n, dtype=float)
     q[order] = adj
     return np.clip(q, 0, 1)
+
+def compute_rank_stats(a: np.ndarray, c: np.ndarray):
+    """
+    Compute rank statistics for two groups.
+    Returns mean ranks and rank difference (a_mean_rank - c_mean_rank).
+    """
+    if len(a) == 0 or len(c) == 0:
+        return np.nan, np.nan, np.nan
+    
+    # Combine both groups
+    combined = np.concatenate([a, c])
+    
+    # Rank all values together (average ranking for ties)
+    ranks = rankdata(combined, method='average')
+    
+    # Split ranks back to original groups
+    n_a = len(a)
+    a_ranks = ranks[:n_a]
+    c_ranks = ranks[n_a:]
+    
+    # Calculate mean ranks
+    a_mean_rank = np.mean(a_ranks)
+    c_mean_rank = np.mean(c_ranks)
+    rank_diff = a_mean_rank - c_mean_rank
+    
+    return float(a_mean_rank), float(c_mean_rank), float(rank_diff)
 
 def cliffs_delta(a: np.ndarray, b: np.ndarray):
     """
@@ -108,18 +134,29 @@ def sig_stars(p_or_q: float):
     return "ns"
 
 def plot_box_for_roi(df: pd.DataFrame, diagnosis_col: str, roi: str, outdir: Path,
-                     mw_p: float = np.nan, mw_q: float = np.nan):
+                     mw_p: float = np.nan, mw_q: float = np.nan, 
+                     rank_diff: float = np.nan):
     labels = df[diagnosis_col].astype(str)
     adhd = df[labels.str.contains("ADHD", case=False, na=False)][roi].dropna().values
     ctrl  = df[labels.str.contains("control|normal", case=False, na=False)][roi].dropna().values
 
-    fig = plt.figure(figsize=(6, 4))
+    fig = plt.figure(figsize=(6, 5))
     # Matplotlib 3.9+: labels -> tick_labels
     plt.boxplot([ctrl, adhd], tick_labels=["Control/Normal", "ADHD"])
     star = sig_stars(mw_q if not pd.isna(mw_q) else mw_p)
+    
+    # Enhanced title with rank information
     title_line1 = f"{roi} volume: ADHD vs Control"
     title_line2 = f"MW p={mw_p:.3g}, q={mw_q:.3g} {star}" if not pd.isna(mw_p) else ""
-    plt.title(title_line1 + ("\n" + title_line2 if title_line2 else ""))
+    title_line3 = f"Rank diff (ADHD-Control): {rank_diff:+.1f}" if not pd.isna(rank_diff) else ""
+    
+    full_title = title_line1
+    if title_line2:
+        full_title += "\n" + title_line2
+    if title_line3:
+        full_title += "\n" + title_line3
+    
+    plt.title(full_title, fontsize=10)
     plt.xlabel("Group")
     plt.ylabel(roi)
     plt.tight_layout()
@@ -149,7 +186,7 @@ def main(roi_csv: str, excel_path: str, outdir: str, alpha: float = 0.05):
     diagnosis_col = find_diagnosis_column(df)
     adhd_df, ctrl_df = choose_groups(df, diagnosis_col)
 
-    # First pass: compute MW p-values and effect sizes
+    # First pass: compute MW p-values, effect sizes, and rank statistics
     rows = []
     skipped = []
     for roi in rois:
@@ -165,6 +202,9 @@ def main(roi_csv: str, excel_path: str, outdir: str, alpha: float = 0.05):
                 "ADHD_n": len(a), "Control_n": len(c),
                 "ADHD_mean": float(np.mean(a)) if len(a) else np.nan,
                 "Control_mean": float(np.mean(c)) if len(c) else np.nan,
+                "ADHD_mean_rank": np.nan,
+                "Control_mean_rank": np.nan,
+                "Rank_diff": np.nan,
                 "MW_U": np.nan, "MW_pvalue": np.nan,
                 "Cliffs_delta": np.nan, "Cliffs_magnitude": "NA",
                 "Note": "Insufficient samples",
@@ -175,11 +215,17 @@ def main(roi_csv: str, excel_path: str, outdir: str, alpha: float = 0.05):
         # MW test (SciPy chooses exact/asymptotic automatically)
         U, p_u = mannwhitneyu(a, c, alternative="two-sided", method="auto")
         delta, delta_mag = cliffs_delta(a, c)
+        
+        # Compute rank statistics
+        a_mean_rank, c_mean_rank, rank_diff = compute_rank_stats(a, c)
 
         rows.append({
             "ROI": roi,
             "ADHD_n": int(len(a)), "Control_n": int(len(c)),
             "ADHD_mean": float(np.mean(a)), "Control_mean": float(np.mean(c)),
+            "ADHD_mean_rank": a_mean_rank,
+            "Control_mean_rank": c_mean_rank,
+            "Rank_diff": rank_diff,
             "MW_U": float(U), "MW_pvalue": float(p_u),
             "Cliffs_delta": float(delta), "Cliffs_magnitude": delta_mag
         })
@@ -194,7 +240,7 @@ def main(roi_csv: str, excel_path: str, outdir: str, alpha: float = 0.05):
         res_df["MW_qvalue"] = np.nan
         res_df["sig_MW_FDR_0.05"] = False
 
-    # Second pass: generate plots with p/q annotations
+    # Second pass: generate plots with p/q and rank difference annotations
     plot_paths = []
     for i, row in res_df.iterrows():
         roi = row["ROI"]
@@ -203,7 +249,9 @@ def main(roi_csv: str, excel_path: str, outdir: str, alpha: float = 0.05):
             continue
         p = row["MW_pvalue"]
         q = row["MW_qvalue"]
-        plot_path = plot_box_for_roi(df, diagnosis_col, roi, outdir, mw_p=p, mw_q=q)
+        rank_diff = row["Rank_diff"]
+        plot_path = plot_box_for_roi(df, diagnosis_col, roi, outdir, 
+                                     mw_p=p, mw_q=q, rank_diff=rank_diff)
         plot_paths.append(str(plot_path))
     res_df["Plot"] = plot_paths
 
@@ -214,19 +262,25 @@ def main(roi_csv: str, excel_path: str, outdir: str, alpha: float = 0.05):
     # Report
     report_txt = outdir / "report.txt"
     with report_txt.open("w", encoding="utf-8") as f:
-        f.write("Basal Ganglia ROI analysis (ADHD vs Control/Normal) — MW only\n")
+        f.write("Basal Ganglia ROI analysis (ADHD vs Control/Normal) — MW with Rank Stats\n")
         f.write(f"Diagnosis column: {diagnosis_col}\n")
         f.write(f"Results CSV: {res_csv}\n")
-        f.write(f"FDR alpha: {alpha}\n")
+        f.write(f"FDR alpha: {alpha}\n\n")
+        
+        f.write("Rank Difference Interpretation:\n")
+        f.write("  - Positive rank diff: ADHD group has higher values on average\n")
+        f.write("  - Negative rank diff: Control group has higher values on average\n")
+        f.write("  - Larger absolute value: Stronger separation between groups\n\n")
+        
         if skipped:
-            f.write("\nROIs not found in Excel columns:\n")
+            f.write("ROIs not found in Excel columns:\n")
             for r in skipped:
                 f.write(f"  - {r}\n")
 
-    print(f"[OK] Saved MW-only results to: {res_csv}")
+    print(f"[OK] Saved MW results with rank statistics to: {res_csv}")
     if skipped:
         print(f"[WARN] Missing ROIs (not in Excel): {', '.join(skipped)}")
-    print(f"[OK] Per-ROI boxplots (with MW p/q & stars) saved under: {outdir}")
+    print(f"[OK] Per-ROI boxplots (with MW p/q, stars & rank diff) saved under: {outdir}")
 
 if __name__ == "__main__":
     # Update these paths or add argparse if you prefer CLI flags
